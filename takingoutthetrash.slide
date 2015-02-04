@@ -1,0 +1,317 @@
+Taking Out the Trash
+Optimizing Memory Allocation in Go Programs
+03 Feb 2015
+Tags: memory, optimization, profiling
+
+Kamil Kisiel
+Freelance Developer
+kamil@kamilkisiel.net
+http://www.kamilkisiel.net
+@kisielk
+
+* Introduction
+
+This talk is divided in to three sections, which are also the steps you should generally take when optimizing:
+
+- Identify Problems
+- Measure Progress
+- Write the Solution
+
+* Before we begin: some warnings
+
+I'm sure you've all heard...  premature optimization is the root of all evil.
+
+You won't need to use the techniques in this talk 99% of the time, but they will help in the other 1%.
+
+As in carpentry: measure twice, cut once.
+
+Generating *some* garbage in you program is nearly unavoidable in most cases unless you go to extremes. Most of the time it's fine so don't worry about the "garbage collector bogeyman".
+
+* Do you have a problem?
+You may have a memory allocation problem if your program or service...
+
+- is using more memory than expected
+- has latency spikes, especially periodic ones
+
+It may be worth looking in to reducing garbage generated.
+
+* How does Go allocate / deallocate memory?
+Unlike C/C++, programmers do not have (direct) control over memory allocation.
+
+The compiler decides where variables will be allocated:
+
+Stack
+
+- (Most) local variables
+- Cleaned up automatically when the function returns
+
+Heap
+
+- Large local variables that would grow the stack too much
+- Variables the compiler can't prove are not referenced outside the function
+- Cleaned up by garbage collector
+
+.link http://golang.org/doc/faq#stack_or_heap
+
+* Variables passed by value, but...
+
+Slice and map values are actually references to an underlying data structure,
+so the "value" is like a pointer.
+
+.image godata3.png
+
+.link http://research.swtch.com/godata
+
+So returning a slice or map, or passing one to another function, usually incurs a heap allocation.
+
+* When does the garbage collector run?
+Let's go to the source: `src/runtime/mgc0.c`
+
+  // Next GC is after we've allocated an extra amount of memory proportional to
+  // the amount already in use. The proportion is controlled by GOGC environment variable
+  // (100 by default). If GOGC=100 and we're using 4M, we'll GC again when we get to 8M
+
+GC is Mark & Sweep (as of Go 1.4):
+
+- Mark stage traces references from all pointers to their heap objects and marks the objects.
+- Sweep stage walks the heap and reclaims all unmarked objects.
+
+GC is "Stop the World" (as of Go 1.4):
+
+- Everything else in your program stops.
+- The more garbage you create, the more the GC runs, the more pauses in your program.
+
+* Visualizing the garbage collector
+
+.image visualizinggc.png _ 900
+.link http://dave.cheney.net/2014/07/11/visualising-the-go-garbage-collector
+
+* Identifying where memory is allocated
+
+* runtime/pprof
+`runtime/pprof` package provides functionality for profiling your programs.
+To dump the profile to a file just call `pprof.WriteHeapProfile`:
+
+    import runtime/pprof
+
+    func main() {
+        // ...
+        err := os.Create("heap.profile")
+        if err != nil {
+            // ...
+        }
+        err := pprof.WriteHeapProfile(f)
+        if err != nil {
+            // ...
+        }
+
+
+* net/http/pprof
+
+It's more convenient to have pprof accessible over HTTP, and trivial to add to an existing server:
+
+    import _ "net/http/pprof"
+
+    // If not already running an HTTP server
+    go func() {
+        log.Println(http.ListenAndServe("localhost:6060", nil))
+    }()
+
+Then just download the results:
+
+    $ go tool pprof -alloc_objects -svg -output=alloc.svg http://localhost:6060/debug/pprof/heap
+
+The heap allocator always keeps stats on allocations, whether profiling is enabled or not
+so just adding this capability to your program doesn't slow it down.
+
+* Inspecting pprof output
+
+.image pprof.png
+
+* Inspecting pprof output
+
+- Heap profile data is over the lifetime of the program
+- Not fully accurate, sampled at rate determined by `runtime.MemProfileRate`.
+- Useful to understand and compare `-alloc_objects` and `-inuse_objects`
+- For space check `-alloc_space` and `-inuse_space`
+- `-alloc_*` vs. `-inuse_*` gives an estimate of garbage generated
+
+* More info on profiling
+
+Slightly out-of-date article on blog.golang.org still gives a decent overview of the profiler:
+
+.link http://blog.golang.org/profiling-go-programs
+
+* Improving Performance
+
+* Writing benchmarks
+
+Before trying to improve your function, it's best to write a benchmark. They go in to `_test.go` files and look a lot like tests:
+
+    // bench_test.go
+    func BenchmarkNewId(b *testing.B) {
+        for i := 0; i < b.N; i++ {
+                NewId("foo@bar.com/" + strconv.Itoa(i))
+        }
+    }
+
+The `b.N` is a counter set by the testing package to ensure adequate sampling of the function under test.
+
+* Running benchmarks
+
+You run the benchmarks by including the `-bench=.` flag to `go test` . Use the `-benchmem` flag to get allocation stats:
+
+    $ go test -bench=. -benchmem
+    PASS
+    BenchmarkNewId	 5000000	       421 ns/op	      39 B/op	       2 allocs/op
+    ok  	demo	4.722s
+
+
+* An example
+
+    // splitId splits an id in the form user@domain/resource in to its components.
+    func splitId(s string) []string {
+        if s == "" {
+               return []string{"", "", ""}
+        }
+        var name, domain, resource string
+        userDomain := strings.SplitN(s, "@", 2)
+        if len(userDomain) == 2 {
+                name = userDomain[0]
+                s = userDomain[1]
+        }
+        domainResource := strings.SplitN(s, "/", 2)
+        if len(domainResource) == 2 {
+               domain = domainResource[0]
+               resource = domainResource[1]
+        }
+        return []string{name, domain, resource}
+    }
+
+Looks fine, right? In most cases it would be, but if called a lot it generates a lot of garbage.
+
+* Checking for escaped locals
+
+The compiler includes a handy flag, `-m`, which tells you what variables escape.
+
+If we compile the previous example we get::
+
+    $ go build -gcflags -m
+
+    # _/Users/kamil/tmp
+    ./split.go:4: []string literal escapes to heap
+    ./split.go:17: []string literal escapes to heap
+    ./split.go:2: splitId s does not escape
+
+Using this knowledge and results from pprof that showed allocations happening in `strings.SplitN` we can improve the preceding example.
+
+* An improved example
+
+    func splitId (s string) (user, domain, resource string) {
+        if s == "" {
+               return
+        }
+        userDomain := strings.IndexByte(s, '@')
+        if userDomain != -1 {
+                user = s[:userDomain]
+                s = s[userDomain+1:]
+        }
+        domainResource := strings.IndexByte(s, '/')
+        if domainResource != -1 {
+                domain = s[:domainResource]
+                resource = s[domainResource+1:]
+        } else {
+                domain = s
+        }
+        return
+    }
+
+By using indexing, we've removed all allocations! Return values are just slices of the original argument.
+
+* Comparing results
+
+You can compare benchmark results with the `benchcmp` program. Assuming you saved old benchmark results to `old.txt` and new to `new.txt`:
+
+    $ benchcmp old.txt new.txt
+    benchmark          old ns/op     new ns/op     delta
+    BenchmarkNewId     1019          473           -53.58%
+
+    benchmark          old allocs    new allocs    delta
+    BenchmarkNewId     7             2             -71.43%
+
+    benchmark          old bytes     new bytes     delta
+    BenchmarkNewId     255           105           -58.82%
+
+Include the `benchcmp` result in your commit message! It serves as a good history of the improvements you made and justifies the changes.
+
+
+* Strategies for reducing garbage
+
+* Slice reuse
+
+If you have a slice `a` that you want to filter with a function `f` you'd usually write it like this:
+
+    b := make([]string)
+    for _, x := range a {
+        if f(x) {
+            b = append(b, x)
+        }
+    }
+
+If you no longer need the slice `a` you can reuse the storage and save a slice allocation:
+
+    b := a[:0]
+    for _, x := range a {
+        if f(x) {
+            b = append(b, x)
+        }
+    }
+
+This is a useful trick in loops or areas of high traffic.
+
+* Slices as arguments
+When writing an API, accepting a slice as an argument can be used to give the caller control over allocation.
+A good example is in the `net` package:
+
+    type Conn interface {
+        Read(b []byte) (n int, err error)
+        // ...
+
+
+Caller, usually in a loop, can do:
+    
+    buf := make([]byte, 1024)
+    n, err := conn.Read(b)
+    if err != nil {
+        // ...
+    }
+    doSomething(buf[:n])
+
+If `Read` returned `[]byte` it would require allocation on every call.
+
+* sync.Pool
+From the documentation:
+
+    Pool's purpose is to cache allocated but unused items for later reuse, relieving 
+    pressure on the garbage collector. That is, it makes it easy to build efficient, 
+    thread-safe free lists. However, it is not suitable for all free lists.
+
+For example:
+
+    var expensiveThingPool sync.Pool{
+        New: func() interface{} { 
+            return newExpensiveThing()
+        }}
+
+    func do() {
+        expensiveThing := expensiveThingPool.Get().(*expensiveThingT)
+        // do stuff with expensiveThing
+        expensiveThingPool.Put(expensiveThing)
+    }
+
+* Summary
+
+- Despite no explicit means of control over memory, Go provides a lot of ways to tune allocation.
+- Don't worry about these things till you need to.
+- But when you do, Go is there for you...
+- The standard Go distribution comes with a lot of powerful tools.

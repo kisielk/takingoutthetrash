@@ -6,4 +6,4 @@ Thanks to @JingwenOwenOu for organizing the meetup, Mobiy for providing the spac
 
 You can view the slides at http://go-talks.appspot.com/github.com/kisielk/takingoutthetrash/takingoutthetrash.slide
 
-The talk was also recorded via Google Hangouts on Air and is available at https://plus.google.com/u/2/events/cv1o1k0itr86tr76b59vg3j0j2s
+The talk was also recorded via Google Hangouts on Air and is available at https://www.youtube.com/watch?v=l3zHGMgtr2Y
